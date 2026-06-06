@@ -30,10 +30,24 @@ class MainActivity : FlutterActivity() {
     private var connectedHost: BluetoothDevice? = null
     private var isRegistered = false
 
+    // BUG FIX 1: Track whether profile proxy is ready before using it.
+    // Previously, start() could be called before onServiceConnected fired,
+    // leaving hidDevice null and silently failing.
+    private var profileReady = false
+    private var pendingStartResult: MethodChannel.Result? = null
+
     private val profileListener = object : BluetoothProfile.ServiceListener {
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
             if (profile == BluetoothProfile.HID_DEVICE) {
                 hidDevice = proxy as BluetoothHidDevice
+                profileReady = true
+
+                // BUG FIX 1 (cont): If Flutter called start() before the profile
+                // was ready, we deferred it. Fulfil it now.
+                pendingStartResult?.let { result ->
+                    pendingStartResult = null
+                    startHid(result)
+                }
             }
         }
 
@@ -42,6 +56,7 @@ class MainActivity : FlutterActivity() {
                 hidDevice = null
                 connectedHost = null
                 isRegistered = false
+                profileReady = false
             }
         }
     }
@@ -49,7 +64,13 @@ class MainActivity : FlutterActivity() {
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             isRegistered = registered
-            connectedHost = pluggedDevice
+            // BUG FIX 2: Only update connectedHost from onAppStatusChanged if a device
+            // is actually plugged in. Previously this overwrote a good connection.
+            if (registered && pluggedDevice != null) {
+                connectedHost = pluggedDevice
+            } else if (!registered) {
+                connectedHost = null
+            }
             sendStatus()
         }
 
@@ -61,21 +82,32 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
+
+        // BUG FIX 3: Guard against a null BluetoothManager (e.g. emulator with no BT).
+        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        bluetoothAdapter = manager?.adapter
+
         bluetoothAdapter?.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
 
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-        channel?.setMethodCallHandler {
-            call,
-            result ->
+        channel?.setMethodCallHandler { call, result ->
             when (call.method) {
-                "isSupported" -> result.success(Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && bluetoothAdapter != null)
+                "isSupported" -> result.success(
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && bluetoothAdapter != null
+                )
                 "requestPermissions" -> result.success(requestBluetoothPermissions())
                 "openBluetoothSettings" -> {
                     startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS))
                     result.success(true)
                 }
-                "start" -> startHid(result)
+                "start" -> {
+                    if (!profileReady) {
+                        // Profile proxy not yet connected — defer until it is.
+                        pendingStartResult = result
+                    } else {
+                        startHid(result)
+                    }
+                }
                 "stop" -> stopHid(result)
                 "devices" -> result.success(bondedDevices())
                 "connect" -> connect(call, result)
@@ -122,12 +154,23 @@ class MainActivity : FlutterActivity() {
 
         val adapter = bluetoothAdapter
         val device = hidDevice
-        if (adapter == null || device == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-            result?.error("unsupported", "Bluetooth HID Device is not available on this phone.", null)
+
+        // BUG FIX 4: Cleaner guard — each condition returns its own error message.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            result?.error("unsupported", "Android 9+ is required for Bluetooth HID Device.", null)
+            return
+        }
+        if (adapter == null) {
+            result?.error("unsupported", "No Bluetooth adapter found on this device.", null)
+            return
+        }
+        if (device == null) {
+            // Should not happen after the deferred-start fix, but guard anyway.
+            result?.error("not_ready", "HID Device profile not ready yet. Try again.", null)
             return
         }
         if (!adapter.isEnabled) {
-            result?.error("bluetooth_off", "Turn Bluetooth on before starting HID mode.", null)
+            result?.error("bluetooth_off", "Please turn Bluetooth on before starting HID mode.", null)
             return
         }
         if (isRegistered) {
@@ -138,20 +181,17 @@ class MainActivity : FlutterActivity() {
         val sdp = BluetoothHidDeviceAppSdpSettings(
             "Flutter HID Gamepad",
             "Low-latency virtual Bluetooth game controller",
-            "flutter_learnig",
+            "flutter_learning",
             0x08.toByte(),
             gamepadDescriptor
         )
         val inQos = BluetoothHidDeviceAppQosSettings(
             BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
-            800,
-            9,
-            0,
-            11250,
-            11250
+            800, 9, 0, 11250, 11250
         )
 
-        result?.success(device.registerApp(sdp, inQos, null, executor, hidCallback))
+        val ok = device.registerApp(sdp, inQos, null, executor, hidCallback)
+        result?.success(ok)
     }
 
     @SuppressLint("MissingPermission")
@@ -164,13 +204,21 @@ class MainActivity : FlutterActivity() {
 
     @SuppressLint("MissingPermission")
     private fun bondedDevices(): List<Map<String, String>> {
+        // BUG FIX 5: Guard against Bluetooth being off — bondedDevices throws
+        // IllegalStateException if the adapter is disabled.
         if (!requestBluetoothPermissions()) return emptyList()
-        return bluetoothAdapter?.bondedDevices?.map {
-            mapOf(
-                "name" to (it.name ?: "Unknown device"),
-                "address" to it.address
-            )
-        } ?: emptyList()
+        if (bluetoothAdapter?.isEnabled != true) return emptyList()
+
+        return try {
+            bluetoothAdapter?.bondedDevices?.map {
+                mapOf(
+                    "name" to (it.name ?: "Unknown device"),
+                    "address" to it.address
+                )
+            } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -179,40 +227,67 @@ class MainActivity : FlutterActivity() {
             result.success(false)
             return
         }
-        val address = call.argument<String>("address")
-        val device = bluetoothAdapter?.bondedDevices?.firstOrNull { it.address == address }
-        if (device == null) {
-            result.error("not_bonded", "Pair the desktop first, then retry.", null)
+
+        // BUG FIX 6: hidDevice could be null here if profile disconnected unexpectedly.
+        val hid = hidDevice
+        if (hid == null) {
+            result.error("not_ready", "HID Device profile is not available.", null)
             return
         }
-        result.success(hidDevice?.connect(device) == true)
+
+        val address = call.argument<String>("address")
+        if (address.isNullOrBlank()) {
+            result.error("invalid_address", "No device address provided.", null)
+            return
+        }
+
+        val device = try {
+            bluetoothAdapter?.bondedDevices?.firstOrNull { it.address == address }
+        } catch (e: Exception) {
+            null
+        }
+
+        if (device == null) {
+            result.error("not_bonded", "Pair the desktop first in Bluetooth settings, then retry.", null)
+            return
+        }
+
+        result.success(hid.connect(device) == true)
     }
 
     @SuppressLint("MissingPermission")
     private fun sendReport(call: MethodCall, result: MethodChannel.Result) {
-        val buttons = call.argument<Int>("buttons") ?: 0
-        val hat = call.argument<Int>("hat") ?: 8
-        val lx = (call.argument<Int>("lx") ?: 0).coerceIn(-127, 127)
-        val ly = (call.argument<Int>("ly") ?: 0).coerceIn(-127, 127)
-        val rx = (call.argument<Int>("rx") ?: 0).coerceIn(-127, 127)
-        val ry = (call.argument<Int>("ry") ?: 0).coerceIn(-127, 127)
         val host = connectedHost
-
         if (host == null) {
+            // BUG FIX 7: Return false (not an error crash) so Flutter can handle it gracefully.
             result.success(false)
             return
         }
 
+        // BUG FIX 8: Safely coerce each axis value — previously could panic on bad input.
+        val buttons = (call.argument<Int>("buttons") ?: 0).and(0xFFFF)
+        val hat     = (call.argument<Int>("hat") ?: 8).and(0x0F)
+        val lx      = (call.argument<Int>("lx") ?: 0).coerceIn(-127, 127)
+        val ly      = (call.argument<Int>("ly") ?: 0).coerceIn(-127, 127)
+        val rx      = (call.argument<Int>("rx") ?: 0).coerceIn(-127, 127)
+        val ry      = (call.argument<Int>("ry") ?: 0).coerceIn(-127, 127)
+
         val report = byteArrayOf(
             (buttons and 0xff).toByte(),
             ((buttons shr 8) and 0xff).toByte(),
-            (hat and 0x0f).toByte(),
+            hat.toByte(),
             lx.toByte(),
             ly.toByte(),
             rx.toByte(),
             ry.toByte()
         )
-        result.success(hidDevice?.sendReport(host, 1, report) == true)
+
+        val ok = try {
+            hidDevice?.sendReport(host, 1, report) == true
+        } catch (e: Exception) {
+            false
+        }
+        result.success(ok)
     }
 
     private fun sendStatus() {
@@ -221,9 +296,9 @@ class MainActivity : FlutterActivity() {
 
     @SuppressLint("MissingPermission")
     private fun statusMap(): Map<String, Any?> = mapOf(
-        "registered" to isRegistered,
-        "connected" to (connectedHost != null),
-        "hostName" to connectedHost?.name,
+        "registered"  to isRegistered,
+        "connected"   to (connectedHost != null),
+        "hostName"    to try { connectedHost?.name } catch (e: Exception) { null },
         "hostAddress" to connectedHost?.address
     )
 
