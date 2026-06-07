@@ -14,7 +14,7 @@
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-name: console
+name: console2.0
 description: A package that does something awesome.
 version: 4.1.1
 homepage: https://github.com/justwasif/console
