@@ -1,4 +1,4 @@
-import 'package:console/main.dart';
+import 'package:console2_0/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
