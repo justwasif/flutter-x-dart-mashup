@@ -16,7 +16,7 @@
 # of the product and file versions while build-number is used as the build suffix.
 name: console
 description: A package that does something awesome.
-version: 4.1.1
+version: 4.1.0
 homepage: https://github.com/justwasif/console
 repository: https://github.com/justwasif/console
 
